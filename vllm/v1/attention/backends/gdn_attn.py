@@ -84,6 +84,10 @@ class GDNAttentionMetadata:
     nums_dict: dict | None = None
     batch_ptr: torch.Tensor | None = None
     token_chunk_offset_ptr: torch.Tensor | None = None
+    # Host lengths for the non-spec causal conv, including leading decode rows
+    # when a mixed batch is convolved together. Built once so GDN layers do
+    # not each sync query_start_loc back to the host.
+    non_spec_seq_lens_cpu: list[int] | None = None
 
 
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
@@ -241,6 +245,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         query_start_loc = m.query_start_loc
         query_start_loc_cpu = m.query_start_loc_cpu
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
+        non_spec_seq_lens_cpu: list[int] | None = None
         aligned_state_indices = getattr(self, "mamba_aligned_state_indices", None)
         if aligned_state_indices is not None:
             block_table_tensor = aligned_state_indices[: m.num_reqs]
@@ -467,6 +472,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     device=query_start_loc.device,
                 )
             )
+            if non_spec_query_start_loc_cpu is not None:
+                non_spec_seq_lens_cpu = non_spec_query_start_loc_cpu.diff().tolist()
             if spec_sequence_masks is None and num_decodes > 0:
                 prefill_has_initial_state = has_initial_state[num_decodes:]
             else:
@@ -578,6 +585,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
+            non_spec_seq_lens_cpu=non_spec_seq_lens_cpu,
         )
         return attn_metadata
 

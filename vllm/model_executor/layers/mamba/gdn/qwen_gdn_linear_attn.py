@@ -86,6 +86,79 @@ if GDN_AITER_TRITON_AVAILABLE:
 
 logger = init_logger(__name__)
 
+# Qwen3.8-27B TP1 conv: 2 * (16 * 128) + 48 * 128 = 10240 channels, width 4.
+# AITER FlyDSL causal-conv prefill (ROCm/aiter#5992) was measured on this
+# shape. TP>1 shards the conv, so it stays on the Triton kernel.
+_FLYDSL_GDN_CONV_CHANNELS = 10240
+_FLYDSL_GDN_CONV_WIDTH = 4
+_flydsl_gdn_conv_prefill_fn = None
+_flydsl_gdn_conv_prefill_missing = False
+
+
+def _maybe_flydsl_gdn_conv_prefill(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    activation: str | None,
+    conv_states: torch.Tensor,
+    has_initial_state: torch.Tensor | None,
+    cache_indices: torch.Tensor | None,
+    query_start_loc: torch.Tensor | None,
+    seq_lens_cpu: list[int] | None,
+    tp_size: int,
+) -> torch.Tensor | None:
+    """FlyDSL causal-conv prefill, or None when the Triton kernel should run."""
+    global _flydsl_gdn_conv_prefill_fn, _flydsl_gdn_conv_prefill_missing
+    if (
+        not envs.VLLM_ROCM_USE_FLYDSL_GDN_CONV
+        or not current_platform.is_rocm()
+        or tp_size != 1
+        or _flydsl_gdn_conv_prefill_missing
+    ):
+        return None
+    if (
+        x.dtype not in (torch.bfloat16, torch.float16)
+        or x.shape[0] != _FLYDSL_GDN_CONV_CHANNELS
+        or tuple(weight.shape) != (_FLYDSL_GDN_CONV_CHANNELS, _FLYDSL_GDN_CONV_WIDTH)
+        or activation not in (None, "silu", "swish")
+        or query_start_loc is None
+        or not seq_lens_cpu
+    ):
+        return None
+    if _flydsl_gdn_conv_prefill_fn is None:
+        try:
+            from aiter.ops.flydsl.causal_conv1d_flydsl import (
+                causal_conv1d_prefill_flydsl_fn,
+            )
+        except ImportError:
+            _flydsl_gdn_conv_prefill_missing = True
+            logger.warning_once(
+                "VLLM_ROCM_USE_FLYDSL_GDN_CONV is set, but "
+                "aiter.ops.flydsl.causal_conv1d_flydsl is unavailable. "
+                "GDN prefill conv stays on Triton. This kernel is "
+                "ROCm/aiter#5992."
+            )
+            return None
+        _flydsl_gdn_conv_prefill_fn = causal_conv1d_prefill_flydsl_fn
+        logger.info_once(
+            "Using FlyDSL GDN causal-conv prefill (channels=%d, width=%d).",
+            _FLYDSL_GDN_CONV_CHANNELS,
+            _FLYDSL_GDN_CONV_WIDTH,
+        )
+    return _flydsl_gdn_conv_prefill_fn(
+        x,
+        weight,
+        bias,
+        conv_states=conv_states,
+        query_start_loc=query_start_loc,
+        seq_lens_cpu=seq_lens_cpu,
+        cache_indices=cache_indices,
+        has_initial_state=has_initial_state,
+        activation=activation,
+        validate_data=False,
+    )
+
+
 MAX_FUSED_GDN_MTP_TOKENS = 8
 FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
 
@@ -1351,19 +1424,33 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if attn_metadata.num_prefills > 0:
             assert mixed_qkv_non_spec is not None
             mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
-            # - "cache_indices" updates the conv_state cache in positions
-            #   pointed to by "state_indices_tensor"
-            mixed_qkv_non_spec = causal_conv1d_fn(
+            # Drop-in for causal_conv1d_fn, same contract as AITER #5992.
+            flydsl_conv = _maybe_flydsl_gdn_conv_prefill(
                 mixed_qkv_non_spec_T,
                 conv_weights,
                 self.conv1d.bias,
-                activation=self.activation,
-                conv_states=conv_state,
-                has_initial_state=has_initial_state,
-                cache_indices=non_spec_state_indices_tensor,
-                query_start_loc=non_spec_query_start_loc,
-                metadata=attn_metadata,
-            ).transpose(0, 1)
+                self.activation,
+                conv_state,
+                has_initial_state,
+                non_spec_state_indices_tensor,
+                non_spec_query_start_loc,
+                attn_metadata.non_spec_seq_lens_cpu,
+                self.tp_size,
+            )
+            if flydsl_conv is None:
+                mixed_qkv_non_spec = causal_conv1d_fn(
+                    mixed_qkv_non_spec_T,
+                    conv_weights,
+                    self.conv1d.bias,
+                    activation=self.activation,
+                    conv_states=conv_state,
+                    has_initial_state=has_initial_state,
+                    cache_indices=non_spec_state_indices_tensor,
+                    query_start_loc=non_spec_query_start_loc,
+                    metadata=attn_metadata,
+                ).transpose(0, 1)
+            else:
+                mixed_qkv_non_spec = flydsl_conv.transpose(0, 1)
         elif attn_metadata.num_decodes > 0:
             assert mixed_qkv_non_spec is not None
             mixed_qkv_non_spec = causal_conv1d_update(

@@ -150,6 +150,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_AITER_MLA_DCP_VERIFY: Literal["asm", "segmented"] = "segmented"
     VLLM_ROCM_USE_AITER_MHA: bool = True
     VLLM_ROCM_USE_AITER_FP4_ASM_GEMM: bool = False
+    VLLM_ROCM_USE_FLYDSL_GDN_CONV: bool = False
     VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA: bool = False
     VLLM_ROCM_USE_AITER_TRITON_ROPE: bool = False
     VLLM_ROCM_USE_AITER_FP8BMM: bool = True
@@ -1357,6 +1358,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default is disabled.
     "VLLM_ROCM_USE_AITER_FP4_ASM_GEMM": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_FP4_ASM_GEMM", "False").lower() in ("true", "1")
+    ),
+    # Opt-in FlyDSL causal-conv1d prefill for Qwen3.8 GDN at TP1
+    # (10240 channels, width 4). Requires ROCm/aiter#5992. Decode is unchanged.
+    "VLLM_ROCM_USE_FLYDSL_GDN_CONV": lambda: (
+        os.getenv("VLLM_ROCM_USE_FLYDSL_GDN_CONV", "False").lower() in ("true", "1")
     ),
     # Whether sparse MLA prefill and decode run on aiter's Triton kernel, which
     # reads the KV cache as stored (bf16 or fp8, paged or flat). Used by the
